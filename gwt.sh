@@ -136,7 +136,9 @@ gwt() {
         local tmpfile last_line rc
         tmpfile=$(mktemp)
         _gwt_run "$@" | tee "$tmpfile"
-        rc=${PIPESTATUS[0]}
+        # zsh stores pipeline statuses in lowercase `pipestatus` (1-indexed);
+        # bash uses `PIPESTATUS`. Prefer zsh's when present.
+        rc=${pipestatus[1]:-${PIPESTATUS[0]}}
         last_line=$(tail -n1 "$tmpfile")
         rm "$tmpfile"
 

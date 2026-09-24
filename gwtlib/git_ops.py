@@ -40,7 +40,12 @@ def is_worktree_dirty(worktree_path: str, include_untracked: bool = True) -> boo
 
 
 def run_git_command(cmd_args, git_dir, capture=True):
-    """Execute git commands with specified git directory."""
+    """Execute git commands with specified git directory.
+
+    With capture=True (default), the command's stdout/stderr are echoed to
+    stderr and the CompletedProcess is returned. With capture=False the
+    command runs attached to the terminal.
+    """
     cmd = ["git", f"--git-dir={git_dir}"] + cmd_args
     if capture:
         result = subprocess.run(cmd, check=True, capture_output=True, text=True)

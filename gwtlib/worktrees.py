@@ -24,8 +24,13 @@ from gwtlib.branches import (
     remote_branch_exists,
 )
 from gwtlib.config import get_repo_config
-from gwtlib.git_ops import _parallel_map, is_worktree_dirty, run_git_command
-from gwtlib.github import get_pr_state
+from gwtlib.git_ops import (
+    _parallel_map,
+    is_worktree_dirty,
+    run_git_command,
+    run_git_rc,
+)
+from gwtlib.github import get_pr_info, get_pr_state
 from gwtlib.parsing import get_main_branch_name, get_worktree_list
 from gwtlib.paths import get_main_worktree_path, get_worktree_base
 from gwtlib.ui import prompt_yes_no
@@ -681,6 +686,8 @@ class MergedRmPlan:
     to_remove: List[dict]  # Worktrees with a MERGED PR, clean and unlocked
     skipped_dirty: List[dict]  # MERGED PR but worktree is dirty
     skipped_locked: List[dict]  # MERGED PR but worktree is locked
+    skipped_diverged: List[dict]  # MERGED PR but local commits not in the PR
+    skipped_failed: List[Tuple[dict, str]]  # PR lookup failed (worktree, reason)
     skipped_other: int  # Worktrees without a merged PR (kept silently)
 
 
@@ -688,44 +695,75 @@ def create_merged_rm_plan(git_dir: str) -> MergedRmPlan:
     """Find worktrees whose GitHub PRs are merged, split by removal safety.
 
     PR state is looked up in parallel (one `gh` call per worktree, network-bound).
+    A worktree is only removable when its local branch tip is contained in the
+    merged PR's head -- otherwise `git branch -D` would destroy local commits
+    (a reused branch name, or commits made after the PR merged).
     """
     worktrees = get_worktree_list(git_dir, include_main=False)
 
     def fetch(wt):
         branch = wt.get("branch")
         if not branch:
-            return wt, False
-        pr = get_pr_state(branch, cwd=wt["path"], quiet=True)
-        return wt, bool(pr and pr[1])
+            return wt, ("other", None)
+        info = get_pr_info(branch, cwd=wt["path"], quiet=True)
+        if info.error:
+            return wt, ("failed", info.error)
+        if not info.is_merged:
+            return wt, ("other", None)
+        # Local tip must be contained in the merged PR's head
+        if not info.head_ref_oid:
+            return wt, ("failed", "PR head unknown")
+        if (
+            run_git_rc(
+                [
+                    "merge-base",
+                    "--is-ancestor",
+                    f"refs/heads/{branch}",
+                    info.head_ref_oid,
+                ],
+                git_dir,
+            )
+            != 0
+        ):
+            return wt, ("diverged", None)
+        return wt, ("merged", None)
 
     results = _parallel_map(fetch, worktrees)
 
     to_remove = []
     skipped_dirty = []
     skipped_locked = []
+    skipped_diverged = []
+    skipped_failed = []
     skipped_other = 0
 
-    for wt, is_merged in results:
-        if not is_merged:
+    for wt, (kind, reason) in results:
+        if kind == "other":
             skipped_other += 1
-            continue
-        if is_worktree_dirty(wt["path"]):
+        elif kind == "failed":
+            skipped_failed.append((wt, reason or "unknown"))
+        elif kind == "diverged":
+            skipped_diverged.append(wt)
+        elif is_worktree_dirty(wt["path"]):
             skipped_dirty.append(wt)
-            continue
-        if _is_worktree_locked(wt["path"], git_dir):
+        elif _is_worktree_locked(wt["path"], git_dir):
             skipped_locked.append(wt)
-            continue
-        to_remove.append(wt)
+        else:
+            to_remove.append(wt)
 
     # Deterministic order for output and tests
     to_remove.sort(key=lambda wt: wt["branch"].lower())
     skipped_dirty.sort(key=lambda wt: wt["branch"].lower())
     skipped_locked.sort(key=lambda wt: wt["branch"].lower())
+    skipped_diverged.sort(key=lambda wt: wt["branch"].lower())
+    skipped_failed.sort(key=lambda item: item[0]["branch"].lower())
 
     return MergedRmPlan(
         to_remove=to_remove,
         skipped_dirty=skipped_dirty,
         skipped_locked=skipped_locked,
+        skipped_diverged=skipped_diverged,
+        skipped_failed=skipped_failed,
         skipped_other=skipped_other,
     )
 
@@ -736,6 +774,8 @@ def print_merged_rm_plan(plan: MergedRmPlan, git_dir: str) -> None:
         len(plan.to_remove)
         + len(plan.skipped_dirty)
         + len(plan.skipped_locked)
+        + len(plan.skipped_diverged)
+        + len(plan.skipped_failed)
         + plan.skipped_other
     )
 
@@ -743,7 +783,13 @@ def print_merged_rm_plan(plan: MergedRmPlan, git_dir: str) -> None:
         print("No worktrees found.", file=sys.stderr)
         return
 
-    if not plan.to_remove and not plan.skipped_dirty and not plan.skipped_locked:
+    if (
+        not plan.to_remove
+        and not plan.skipped_dirty
+        and not plan.skipped_locked
+        and not plan.skipped_diverged
+        and not plan.skipped_failed
+    ):
         print("No worktrees with merged PRs to remove.", file=sys.stderr)
         return
 
@@ -770,6 +816,26 @@ def print_merged_rm_plan(plan: MergedRmPlan, git_dir: str) -> None:
         )
         for wt in plan.skipped_locked:
             print(f"  {wt['branch']}  [locked]", file=sys.stderr)
+
+    if plan.skipped_diverged:
+        print(
+            "\nSkipping: merged PR but local commits not in the PR "
+            f"({len(plan.skipped_diverged)}):",
+            file=sys.stderr,
+        )
+        for wt in plan.skipped_diverged:
+            print(
+                f"  {wt['branch']}  [local commits not in merged PR]", file=sys.stderr
+            )
+
+    if plan.skipped_failed:
+        print(
+            f"\nWarning: could not check PR state for {len(plan.skipped_failed)} "
+            "worktree(s):",
+            file=sys.stderr,
+        )
+        for wt, reason in plan.skipped_failed:
+            print(f"  {wt['branch']}  ({reason})", file=sys.stderr)
 
     if plan.skipped_other:
         print(
@@ -877,6 +943,23 @@ def remove_merged_worktrees(
 
     plan = create_merged_rm_plan(git_dir)
     print_merged_rm_plan(plan, git_dir)
+
+    total_worktrees = (
+        len(plan.to_remove)
+        + len(plan.skipped_dirty)
+        + len(plan.skipped_locked)
+        + len(plan.skipped_diverged)
+        + len(plan.skipped_failed)
+        + plan.skipped_other
+    )
+    if total_worktrees and len(plan.skipped_failed) == total_worktrees:
+        # Every PR lookup failed: nothing was checked, nothing was removed
+        print(
+            "Error: PR lookup failed for all worktrees (check gh auth/network). "
+            "Nothing was removed.",
+            file=sys.stderr,
+        )
+        return 1
 
     if not plan.to_remove:
         return 0

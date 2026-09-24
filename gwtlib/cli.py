@@ -13,6 +13,7 @@ from gwtlib.worktrees import remove_merged_worktrees, remove_worktree, switch_br
 
 
 def main():
+    """Parse CLI arguments and dispatch to the matching subcommand."""
     parser = argparse.ArgumentParser(description="Git worktree wrapper")
     # NOTE: When adding new subcommands, also update the completion lists in:
     #   - gwt.sh   (commands="...")
@@ -349,6 +350,8 @@ def main():
             parser.error("cannot combine a branch name with --merged")
         if not args.merged and not args.branch_name:
             parser.error("a branch name or --merged is required")
+        if not args.merged and (args.plan or args.yes):
+            parser.error("--plan and --yes require --merged")
         if args.merged:
             sys.exit(
                 remove_merged_worktrees(git_dir, yes=args.yes, plan_only=args.plan)
