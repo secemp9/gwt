@@ -8,10 +8,12 @@
 #   - _do_delete_remote_branch() - remote deletion + error handling (partially exists)
 
 import os
+import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Tuple
 
 from gwtlib.branches import (
     branch_exists_locally,
@@ -22,7 +24,7 @@ from gwtlib.branches import (
     remote_branch_exists,
 )
 from gwtlib.config import get_repo_config
-from gwtlib.git_ops import is_worktree_dirty, run_git_command
+from gwtlib.git_ops import _parallel_map, is_worktree_dirty, run_git_command
 from gwtlib.github import get_pr_state
 from gwtlib.parsing import get_main_branch_name, get_worktree_list
 from gwtlib.paths import get_main_worktree_path, get_worktree_base
@@ -667,3 +669,224 @@ def _remove_with_prompts(
     # Output cd command if needed
     if safe_dir:
         print(f"cd {safe_dir}")
+
+
+# --- Bulk removal: worktrees whose GitHub PRs are merged ---
+
+
+@dataclass
+class MergedRmPlan:
+    """Plan for bulk removal of worktrees whose PRs are merged."""
+
+    to_remove: List[dict]  # Worktrees with a MERGED PR, clean and unlocked
+    skipped_dirty: List[dict]  # MERGED PR but worktree is dirty
+    skipped_locked: List[dict]  # MERGED PR but worktree is locked
+    skipped_other: int  # Worktrees without a merged PR (kept silently)
+
+
+def create_merged_rm_plan(git_dir: str) -> MergedRmPlan:
+    """Find worktrees whose GitHub PRs are merged, split by removal safety.
+
+    PR state is looked up in parallel (one `gh` call per worktree, network-bound).
+    """
+    worktrees = get_worktree_list(git_dir, include_main=False)
+
+    def fetch(wt):
+        branch = wt.get("branch")
+        if not branch:
+            return wt, False
+        pr = get_pr_state(branch, cwd=wt["path"], quiet=True)
+        return wt, bool(pr and pr[1])
+
+    results = _parallel_map(fetch, worktrees)
+
+    to_remove = []
+    skipped_dirty = []
+    skipped_locked = []
+    skipped_other = 0
+
+    for wt, is_merged in results:
+        if not is_merged:
+            skipped_other += 1
+            continue
+        if is_worktree_dirty(wt["path"]):
+            skipped_dirty.append(wt)
+            continue
+        if _is_worktree_locked(wt["path"], git_dir):
+            skipped_locked.append(wt)
+            continue
+        to_remove.append(wt)
+
+    # Deterministic order for output and tests
+    to_remove.sort(key=lambda wt: wt["branch"].lower())
+    skipped_dirty.sort(key=lambda wt: wt["branch"].lower())
+    skipped_locked.sort(key=lambda wt: wt["branch"].lower())
+
+    return MergedRmPlan(
+        to_remove=to_remove,
+        skipped_dirty=skipped_dirty,
+        skipped_locked=skipped_locked,
+        skipped_other=skipped_other,
+    )
+
+
+def print_merged_rm_plan(plan: MergedRmPlan, git_dir: str) -> None:
+    """Print the bulk removal plan to stderr."""
+    total = (
+        len(plan.to_remove)
+        + len(plan.skipped_dirty)
+        + len(plan.skipped_locked)
+        + plan.skipped_other
+    )
+
+    if total == 0:
+        print("No worktrees found.", file=sys.stderr)
+        return
+
+    if not plan.to_remove and not plan.skipped_dirty and not plan.skipped_locked:
+        print("No worktrees with merged PRs to remove.", file=sys.stderr)
+        return
+
+    if plan.to_remove:
+        print(
+            f"\nWill remove {len(plan.to_remove)} worktree(s) with merged PRs:",
+            file=sys.stderr,
+        )
+        for wt in plan.to_remove:
+            print(f"  {wt['branch']}", file=sys.stderr)
+
+    if plan.skipped_dirty:
+        print(
+            f"\nSkipping: dirty worktree ({len(plan.skipped_dirty)}):",
+            file=sys.stderr,
+        )
+        for wt in plan.skipped_dirty:
+            print(f"  {wt['branch']}  [dirty]", file=sys.stderr)
+
+    if plan.skipped_locked:
+        print(
+            f"\nSkipping: locked worktree ({len(plan.skipped_locked)}):",
+            file=sys.stderr,
+        )
+        for wt in plan.skipped_locked:
+            print(f"  {wt['branch']}  [locked]", file=sys.stderr)
+
+    if plan.skipped_other:
+        print(
+            f"\nSkipping {plan.skipped_other} worktree(s) without a merged PR.",
+            file=sys.stderr,
+        )
+
+
+def execute_merged_rm_plan(plan: MergedRmPlan, git_dir: str) -> bool:
+    """Remove the planned worktrees and their local branches.
+
+    Returns True if every worktree was fully removed (worktree + branch),
+    False if anything failed. Failures are isolated per worktree and
+    reported in a summary at the end.
+    """
+    failures: List[Tuple[str, str]] = []
+
+    # If the shell's cwd is inside a worktree being removed, move out first and
+    # emit a trailing `cd` line on stdout for the shell wrapper to honor.
+    safe_dir: Optional[str] = None
+    for wt in plan.to_remove:
+        safe_dir = _get_safe_dir_if_needed(wt["path"], git_dir)
+        if safe_dir:
+            break
+    if safe_dir:
+        print(
+            "Note: You're in a worktree being removed. "
+            f"Will change to {safe_dir} after removal.",
+            file=sys.stderr,
+        )
+        os.chdir(safe_dir)
+
+    print("\nRemoving worktrees...", file=sys.stderr)
+    for wt in plan.to_remove:
+        path = wt["path"]
+        branch = wt["branch"]
+        print(f"\n{branch}:", file=sys.stderr)
+
+        # Re-check dirtiness to avoid a TOCTOU race (changed since planning)
+        if is_worktree_dirty(path):
+            print("  Skipping: worktree became dirty since planning", file=sys.stderr)
+            failures.append((branch, "dirty since planning"))
+            continue
+
+        try:
+            run_git_command(["worktree", "remove", path], git_dir, capture=False)
+            print("  Removed worktree", file=sys.stderr)
+        except subprocess.CalledProcessError as e:
+            error_msg = e.stderr.strip() if e.stderr else str(e)
+            print(f"  Failed to remove worktree: {error_msg}", file=sys.stderr)
+            failures.append((branch, "worktree removal failed"))
+            continue
+
+        # The PR is merged, so force-delete the branch (handles squash/rebase
+        # merges where `git branch -d` would refuse).
+        try:
+            run_git_command(["branch", "-D", branch], git_dir, capture=False)
+            print(f"  Deleted branch '{branch}'", file=sys.stderr)
+        except subprocess.CalledProcessError as e:
+            error_msg = e.stderr.strip() if e.stderr else str(e)
+            print(f"  Failed to delete branch: {error_msg}", file=sys.stderr)
+            failures.append((branch, "branch deletion failed"))
+
+    if failures:
+        fully_removed = len(plan.to_remove) - len(failures)
+        print("\nSummary:", file=sys.stderr)
+        for branch, reason in failures:
+            print(f"  Failed: {branch} ({reason})", file=sys.stderr)
+        print(
+            f"  {fully_removed} of {len(plan.to_remove)} worktree(s) fully removed.",
+            file=sys.stderr,
+        )
+
+    # Last stdout line for the shell wrapper (cd protocol); omitted when not needed
+    if safe_dir:
+        print(f"cd {safe_dir}")
+
+    return not failures
+
+
+def remove_merged_worktrees(
+    git_dir: str, yes: bool = False, plan_only: bool = False
+) -> int:
+    """Bulk-remove worktrees whose GitHub PRs are merged.
+
+    Args:
+        git_dir: Path to the git directory.
+        yes: Skip the confirmation prompt.
+        plan_only: Only print the plan, don't execute.
+
+    Returns:
+        Exit code: 0 on success (including nothing to do), 1 on failure.
+    """
+    if shutil.which("gh") is None:
+        print(
+            "Error: gh CLI not found. `gwt rm --merged` needs gh to check PR states.",
+            file=sys.stderr,
+        )
+        print(
+            "hint: Install gh, or remove worktrees individually with "
+            "`gwt rm <branch>`.",
+            file=sys.stderr,
+        )
+        return 1
+
+    plan = create_merged_rm_plan(git_dir)
+    print_merged_rm_plan(plan, git_dir)
+
+    if not plan.to_remove:
+        return 0
+    if plan_only:
+        return 0
+
+    if not yes:
+        print("", file=sys.stderr)
+        if not prompt_yes_no("Proceed?"):
+            print("Aborted.", file=sys.stderr)
+            return 0
+
+    return 0 if execute_merged_rm_plan(plan, git_dir) else 1
