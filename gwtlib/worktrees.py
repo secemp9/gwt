@@ -28,6 +28,7 @@ from gwtlib.git_ops import (
     _parallel_map,
     is_worktree_dirty,
     run_git_command,
+    run_git_quiet,
     run_git_rc,
 )
 from gwtlib.github import get_pr_info, get_pr_state
@@ -687,7 +688,8 @@ class MergedRmPlan:
     skipped_dirty: List[dict]  # MERGED PR but worktree is dirty
     skipped_locked: List[dict]  # MERGED PR but worktree is locked
     skipped_diverged: List[dict]  # MERGED PR but local commits not in the PR
-    skipped_failed: List[Tuple[dict, str]]  # PR lookup failed (worktree, reason)
+    skipped_failed: List[Tuple[dict, str]]  # PR lookup/verify failed (worktree, reason)
+    lookup_failed_count: int  # Worktrees whose PR lookup itself failed
     skipped_other: int  # Worktrees without a merged PR (kept silently)
 
 
@@ -697,7 +699,8 @@ def create_merged_rm_plan(git_dir: str) -> MergedRmPlan:
     PR state is looked up in parallel (one `gh` call per worktree, network-bound).
     A worktree is only removable when its local branch tip is contained in the
     merged PR's head -- otherwise `git branch -D` would destroy local commits
-    (a reused branch name, or commits made after the PR merged).
+    (a reused branch name, or commits made after the PR merged). The verified
+    tip SHA is recorded on the entry so execution can re-check it later.
     """
     worktrees = get_worktree_list(git_dir, include_main=False)
 
@@ -707,25 +710,30 @@ def create_merged_rm_plan(git_dir: str) -> MergedRmPlan:
             return wt, ("other", None)
         info = get_pr_info(branch, cwd=wt["path"], quiet=True)
         if info.error:
-            return wt, ("failed", info.error)
+            return wt, ("lookup-failed", info.error)
         if not info.is_merged:
             return wt, ("other", None)
         # Local tip must be contained in the merged PR's head
         if not info.head_ref_oid:
-            return wt, ("failed", "PR head unknown")
-        if (
-            run_git_rc(
-                [
-                    "merge-base",
-                    "--is-ancestor",
-                    f"refs/heads/{branch}",
-                    info.head_ref_oid,
-                ],
-                git_dir,
-            )
-            != 0
-        ):
+            return wt, ("verify-failed", "PR head unknown")
+        try:
+            tip = run_git_quiet(
+                ["rev-parse", f"refs/heads/{branch}"], git_dir
+            ).stdout.strip()
+        except subprocess.CalledProcessError:
+            return wt, ("verify-failed", "could not resolve branch tip")
+        rc = run_git_rc(
+            ["merge-base", "--is-ancestor", f"refs/heads/{branch}", info.head_ref_oid],
+            git_dir,
+        )
+        # Exit codes: 0 = ancestor, 1 = not an ancestor, 128 = error (e.g. the
+        # PR head object is missing locally after a suggestion push or a commit
+        # from another clone). An error must not masquerade as "diverged".
+        if rc == 1:
             return wt, ("diverged", None)
+        if rc != 0:
+            return wt, ("verify-failed", "PR head not available locally (fetch first?)")
+        wt["tip"] = tip
         return wt, ("merged", None)
 
     results = _parallel_map(fetch, worktrees)
@@ -735,12 +743,16 @@ def create_merged_rm_plan(git_dir: str) -> MergedRmPlan:
     skipped_locked = []
     skipped_diverged = []
     skipped_failed = []
+    lookup_failed_count = 0
     skipped_other = 0
 
     for wt, (kind, reason) in results:
         if kind == "other":
             skipped_other += 1
-        elif kind == "failed":
+        elif kind == "lookup-failed":
+            skipped_failed.append((wt, reason or "unknown"))
+            lookup_failed_count += 1
+        elif kind == "verify-failed":
             skipped_failed.append((wt, reason or "unknown"))
         elif kind == "diverged":
             skipped_diverged.append(wt)
@@ -764,6 +776,7 @@ def create_merged_rm_plan(git_dir: str) -> MergedRmPlan:
         skipped_locked=skipped_locked,
         skipped_diverged=skipped_diverged,
         skipped_failed=skipped_failed,
+        lookup_failed_count=lookup_failed_count,
         skipped_other=skipped_other,
     )
 
@@ -880,6 +893,23 @@ def execute_merged_rm_plan(plan: MergedRmPlan, git_dir: str) -> bool:
             failures.append((branch, "dirty since planning"))
             continue
 
+        # Re-check the branch tip to avoid a TOCTOU race: a commit made after
+        # planning (e.g. while the prompt was open) must not be destroyed by
+        # the `git branch -D` below. The worktree's reflog goes away with the
+        # worktree, so such a commit would be hard to recover.
+        planned_tip = wt.get("tip")
+        if planned_tip:
+            try:
+                current_tip = run_git_quiet(
+                    ["rev-parse", f"refs/heads/{branch}"], git_dir
+                ).stdout.strip()
+            except subprocess.CalledProcessError:
+                current_tip = None
+            if current_tip != planned_tip:
+                print("  Skipping: branch changed since planning", file=sys.stderr)
+                failures.append((branch, "branch changed since planning"))
+                continue
+
         try:
             run_git_command(["worktree", "remove", path], git_dir, capture=False)
             print("  Removed worktree", file=sys.stderr)
@@ -952,7 +982,7 @@ def remove_merged_worktrees(
         + len(plan.skipped_failed)
         + plan.skipped_other
     )
-    if total_worktrees and len(plan.skipped_failed) == total_worktrees:
+    if total_worktrees and plan.lookup_failed_count == total_worktrees:
         # Every PR lookup failed: nothing was checked, nothing was removed
         print(
             "Error: PR lookup failed for all worktrees (check gh auth/network). "

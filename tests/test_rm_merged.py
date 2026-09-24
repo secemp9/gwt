@@ -300,6 +300,58 @@ def test_rm_merged_gh_auth_failure_partial(tmp_path, git_env):
     assert _branch_exists(repo, env, "fail-b")
 
 
+def test_rm_merged_pr_head_missing_locally(tmp_path, git_env):
+    # The PR head commit is not available locally (e.g. a suggestion was
+    # committed on GitHub, or pushed from another clone). The worktree must be
+    # reported as unverifiable, not as "local commits not in the PR".
+    env, repo, _git_dir, wt_paths, outside = _make_env(
+        tmp_path, git_env, ["merged-a"], {"merged-a": "MERGED"}
+    )
+    env["PATH"] = _write_stub_gh(
+        tmp_path / "bin",
+        {"merged-a": "MERGED"},
+        {"merged-a": "d" * 40},  # object not present in the repo
+    )
+    res = _run_gwt(env, "rm", "--merged", "-y", cwd=str(outside))
+    assert res.returncode == 0, res.stderr
+    assert "PR head not available locally" in res.stderr
+    assert "local commits not in the PR" not in res.stderr
+    assert wt_paths["merged-a"].exists()
+    assert _branch_exists(repo, env, "merged-a")
+
+
+def test_execute_skips_branch_changed_since_planning(
+    tmp_path, git_env, monkeypatch, capsys
+):
+    # A commit made after planning (e.g. while the Proceed? prompt is open)
+    # keeps the worktree clean, so only the tip re-check can protect it from
+    # the later `git branch -D`.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo, git_env)
+    pr_head = _git(repo, "rev-parse", "HEAD", env=git_env).stdout.strip()
+    _git(repo, "branch", "merged-a", env=git_env)
+    git_dir = str(repo / ".git")
+    wt_path = Path(gwt.get_worktree_base(git_dir)) / "merged-a"
+    _git(repo, "worktree", "add", str(wt_path), "merged-a", env=git_env)
+
+    def fake_get_pr_info(branch, cwd=None, quiet=False):
+        return PrInfo("MERGED", True, pr_head, None)
+
+    monkeypatch.setattr(worktrees_mod, "get_pr_info", fake_get_pr_info)
+
+    plan = worktrees_mod.create_merged_rm_plan(git_dir)
+    assert [wt["branch"] for wt in plan.to_remove] == ["merged-a"]
+
+    _git(wt_path, "commit", "--allow-empty", "-m", "sneaky", env=git_env)
+
+    ok = worktrees_mod.execute_merged_rm_plan(plan, git_dir)
+    assert ok is False
+    assert wt_path.exists()
+    assert _branch_exists(repo, git_env, "merged-a")
+    assert "branch changed since planning" in capsys.readouterr().err
+
+
 def test_rm_merged_gh_missing_errors(tmp_path, git_env):
     env, _repo, _git_dir, _wt_paths, outside = _make_env(tmp_path, git_env, [])
     git_only = tmp_path / "git-only"
@@ -395,6 +447,7 @@ def test_create_merged_rm_plan_buckets(tmp_path, git_env, monkeypatch):
         "locked-e",
         "diverge-f",
         "fail-g",
+        "missing-h",
     )
     for br in branches:
         _git(repo, "branch", br, env=git_env)
@@ -419,6 +472,7 @@ def test_create_merged_rm_plan_buckets(tmp_path, git_env, monkeypatch):
         "locked-e": ("MERGED", True, pr_head),
         "diverge-f": ("MERGED", True, pr_head),
         "fail-g": "error",
+        "missing-h": ("MERGED", True, "d" * 40),  # PR head object absent locally
     }
 
     def fake_get_pr_info(branch, cwd=None, quiet=False):
@@ -438,5 +492,9 @@ def test_create_merged_rm_plan_buckets(tmp_path, git_env, monkeypatch):
     assert [wt["branch"] for wt in plan.skipped_dirty] == ["dirty-d"]
     assert [wt["branch"] for wt in plan.skipped_locked] == ["locked-e"]
     assert [wt["branch"] for wt in plan.skipped_diverged] == ["diverge-f"]
-    assert [wt["branch"] for wt, _reason in plan.skipped_failed] == ["fail-g"]
+    assert [wt["branch"] for wt, _reason in plan.skipped_failed] == [
+        "fail-g",
+        "missing-h",
+    ]
+    assert plan.lookup_failed_count == 1  # only fail-g (missing-h is unverifiable)
     assert plan.skipped_other == 2  # open-b and no-pr-c
