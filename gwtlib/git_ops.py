@@ -1,6 +1,20 @@
 # gwtlib/git_ops.py
+import os
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
+
+
+def _parallel_map(fn, items):
+    """Run fn over items across a small thread pool (git/subprocess release the GIL)."""
+    items = list(items)
+    if not items:
+        return []
+    if len(items) == 1:
+        return [fn(items[0])]
+    workers = min(16, max(1, (os.cpu_count() or 4)), len(items))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        return list(ex.map(fn, items))
 
 
 def is_worktree_dirty(worktree_path: str, include_untracked: bool = True) -> bool:
